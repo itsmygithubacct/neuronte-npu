@@ -153,7 +153,9 @@ Operators and patterns to avoid on driver 0.9.3 / runtime 2.3.2:
   That is enough to flip pixels that lie just past the 0.5 threshold, which
   happens in cells with one sample per pixel (48×96). The backend's
   `refine_margin` recomputes, on the CPU, every tile with a pixel within the
-  margin of 0.5.
+  margin of 0.5. A model that needs it carries the margin in its `.meta`
+  (`refine 0.05`), so the backend refines by default; a caller's positive
+  margin replaces it and a negative one turns it off.
 - **int8 (w8a8)** quality depends on the model. `convert.py --dtype w8a8`
   calibrates on the h1 inputs of all 256 Braille scalars, which is the whole
   input domain of these models. `--quant-algorithm mmse` was more accurate
@@ -179,7 +181,11 @@ Operators and patterns to avoid on driver 0.9.3 / runtime 2.3.2:
 - `tools/run-set.sh SPEC OUT` runs CPU and NPU benchmarks back to back on one
   pinned core, keeping every JSON and coverage dump. `tools/summarize.py`
   gives medians per glyph, and `tools/compare.py` compares dumps with the
-  CPU and with teacher masks.
+  CPU and with teacher masks. `tools/choose-forms.py OUT` picks, per
+  configuration, the fastest NPU run with zero binary flips against that
+  configuration's CPU run. Where two forms are within a few per cent, the
+  choice can change between campaigns (see run-to-run variance below); both
+  are exact, so either is correct.
 - A batch-1 launch costs at least about 31 µs, so single-glyph latency gains
   less than throughput.
 - **The DDR clock moves.** The memory controller has its own on-demand

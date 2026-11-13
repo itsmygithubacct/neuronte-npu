@@ -52,7 +52,9 @@ struct neuronte_npu_options {
                               * backend syncs its own buffers. */
     float refine_margin;     /* NPU path: recompute on the CPU every tile that has a pixel whose
                               * NPU coverage is within this distance of 0.5 (fp16 can flip
-                              * pixels the CPU puts just past the threshold). 0 = off. */
+                              * pixels the CPU puts just past the threshold). 0 = the model's
+                              * own margin (a "refine" line in its meta; none = off), > 0 =
+                              * this margin, < 0 = off. */
 };
 
 /* How an open handle evaluates. */

@@ -114,6 +114,7 @@ struct neuronte_npu {
     rknn_tensor_mem *bound;   /* input buffer bound to the context */
     unsigned init_flags;      /* flags given to rknn_init */
     float refine_margin;      /* recompute ambiguous tiles on the CPU */
+    float meta_refine;        /* the model's own margin ("refine" in the meta), 0 = none */
     int core_mask;            /* applied core mask, 0 = runtime default */
     int npu_cores;            /* cores with a registered completion interrupt, -1 unknown */
     uint32_t *asm_off;        /* zero-copy: native output offset of each cell pixel of glyph 0 */
@@ -184,7 +185,11 @@ static int parse_meta(neuronte_npu *n, const char *path, char *err, size_t err_l
                 n->pos_m < 1)
                 goto bad;
         }
-        else if (!strcmp(key, "tiles")) {
+        else if (!strcmp(key, "refine")) {
+            /* the margin this model needs for output identical to the CPU's */
+            if (sscanf(line, "%*s %f", &n->meta_refine) != 1 || !(n->meta_refine >= 0.0f && n->meta_refine < 0.5f))
+                goto bad;
+        } else if (!strcmp(key, "tiles")) {
             sscanf(line, "%*s %d", &n->ntiles);
             if (n->ntiles < 1 || n->ntiles > MAX_TILES)
                 goto bad;
@@ -805,13 +810,14 @@ int neuronte_npu_open(const struct neuronte_npu_options *o, neuronte_npu **out, 
     }
     if (!(o->flags & NEURONTE_NPU_FORCE_CPU)) {
         if (open_rknn(n, o, err, sizeof err) == 0) {
-            if (o->refine_margin > 0.0f) {
+            float margin = o->refine_margin > 0.0f ? o->refine_margin : o->refine_margin < 0.0f ? 0.0f : n->meta_refine;
+            if (margin > 0.0f) {
                 if (open_cpu(n, o, err, sizeof err)) {
                     say(reason, reason_len, "refinement needs the CPU networks: %s", err);
                     neuronte_npu_close(n);
                     return -1;
                 }
-                n->refine_margin = o->refine_margin;
+                n->refine_margin = margin;
             }
             n->backend = NEURONTE_NPU_RKNN;
             *out = n;

@@ -42,7 +42,9 @@ convolutions run about 1.8× faster, and whole runs were 1.27× faster than
 fp16 (median over 45 configurations). Its error depends on the model:
 screen each quantized model with `--sim-check` and score it against the CPU
 before use. `refine_margin` makes the backend recompute, on the CPU, every
-tile with a pixel near the 0.5 threshold.
+tile with a pixel near the 0.5 threshold. A model can carry its own margin
+(a `refine` line in its `.meta`, written by `convert.py --refine`), which the
+backend applies unless the caller sets one.
 
 ## Results
 
@@ -52,8 +54,10 @@ configurations (15 model sets, each at 8×16, 16×32 and 48×96) and all 256
 Braille patterns: fp16 was 7.8–21.7× faster (median 11.4×) and int8 9.6–21.3×
 (median 15.1×). Every configuration had a form whose binary output matched
 the CPU library exactly (fp16, int8, or fp16 with refinement), at 2.3–21.7×
-(median 13.9×). On boards without an NPU the backend falls back to the CPU
-library and says so.
+(median 13.9×). `tools/choose-forms.py` picks that form for each
+configuration from a benchmark run and assembles the set: models, their
+networks, `forms.json` with the measurements, and `SHA256SUMS`. On boards
+without an NPU the backend falls back to the CPU library and says so.
 
 [docs/RKNPU.md](docs/RKNPU.md) collects what was learned about the RK3588
 NPU: driver and core behaviour, data layouts and cache handling, which
@@ -85,7 +89,9 @@ kept for comparison and to document runtime behaviour; see the docstring of
   on one core, optionally under a lock shared with other benchmark users,
   recording each run's DDR/NPU clock time-in-state), `summarize.py` (medians
   from benchmark JSON, and the mean DDR clock per run), `compare.py`
-  (coverage dumps against the CPU and teacher masks).
+  (coverage dumps against the CPU and teacher masks), `choose-forms.py`
+  (per configuration, the fastest NPU form whose binary output is identical
+  to the CPU library's; `--assemble` copies the chosen forms into a set).
 
 ## Build and run
 
@@ -107,7 +113,8 @@ Run:
 
 `--mode cpu` runs the reference CPU path for comparison. `--no-fallback`
 makes the run fail when the NPU cannot be used. `--refine MARGIN` turns on
-CPU refinement near the threshold.
+CPU refinement near the threshold (0, the default, uses the model's own
+margin; a negative margin turns refinement off).
 
 Check a board first with `tools/npu-discover.sh`. Python tests:
 `make check PYTHON=... NEURONTE_MANIFEST=... NEURONTE_LIB=...` (tests that

@@ -95,7 +95,7 @@ static void usage(void)
     fprintf(stderr,
             "usage: neuronte_npu_bench --meta FILE --models DIR [--rknn FILE] [--runtime LIB]\n"
             "       [--mode npu|cpu] [--no-fallback] [--zero-copy] [--core-mask N] [--cpu K]\n"
-            "       [--no-pipeline] [--init-flags N] [--refine MARGIN]\n"
+            "       [--no-pipeline] [--init-flags N] [--refine MARGIN (0 = the model's own, <0 = off)]\n"
             "       [--warmup N] [--repeats N] [--passes N] [--single N] [--seed N] [--coverage-out FILE]\n");
     exit(2);
 }

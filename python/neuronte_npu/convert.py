@@ -2,7 +2,8 @@
 
     python -m neuronte_npu.convert --manifest M --case NAME --cell 16x32 \
         --batch 256 --out DIR [--dense] [--platform rk3588] [--onnx-only] \
-        [--pool avg|conv] [--dtype fp16|w8a8 [--quant-algorithm normal|mmse]]
+        [--pool avg|conv] [--dtype fp16|w8a8 [--quant-algorithm normal|mmse]] \
+        [--refine MARGIN]
 
 Writes NAME-WxH-bB-{g|d}-L1[-pconv][-w8a8-ALGO].onnx, .rknn (unless
 --onnx-only) and .meta, plus a .l1 (host layer 1: character weights, biases
@@ -16,6 +17,11 @@ block U+2800..U+28FF, the whole input domain of these models, in batches of
 the model's batch size; its sha256 is recorded. Quantization error depends
 on the model: score every quantized model against the CPU before use, and
 give the backend a refine_margin above its largest error.
+
+--refine MARGIN writes the margin into the .meta ("refine MARGIN"): the
+backend then recomputes, on the CPU, every tile with a pixel within MARGIN of
+0.5 unless the caller sets refine_margin itself. Use it for a model whose
+output matches the CPU's only with refinement.
 """
 
 import argparse
@@ -34,7 +40,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def write_meta(path, lay, batch, grouped, members, pos_file=None, l1_file=None):
+def write_meta(path, lay, batch, grouped, members, pos_file=None, l1_file=None, refine=0.0):
     lines = [f"neuronte-npu-meta {META_VERSION}",
              f"name {lay.name}",
              f"cell {lay.cell_w} {lay.cell_h}",
@@ -57,6 +63,8 @@ def write_meta(path, lay, batch, grouped, members, pos_file=None, l1_file=None):
     if l1_file:
         lines.append(f"host-l1 {l1_file} {len(lay.blocks) * lay.hidden} {len(lay.tiles) * nrt.CODE} "
                      f"{lay.samples_per_block}")
+    if refine:
+        lines.append(f"refine {refine:g}")
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -160,9 +168,13 @@ def main(argv=None):
                     help="sample averaging: AveragePool, or the same as a strided depthwise conv")
     ap.add_argument("--dtype", default="fp16", choices=("fp16", "w8a8"))
     ap.add_argument("--quant-algorithm", default="normal", choices=("normal", "mmse", "kl_divergence"))
+    ap.add_argument("--refine", type=float, default=0.0, metavar="MARGIN",
+                    help="refinement margin the backend applies to this model by default (0 = none)")
     ap.add_argument("--sim-check", action="store_true",
                     help="score the compiled model in the toolkit simulator over every Braille scalar")
     args = ap.parse_args(argv)
+    if not 0.0 <= args.refine < 0.5:
+        raise SystemExit("--refine must be in [0, 0.5)")
     if args.dtype != "fp16" and args.l1 != "host":
         raise SystemExit("--dtype w8a8 needs --l1 host (the backend quantizes h1 itself)")
     w, h = map(int, args.cell.lower().split("x"))
@@ -192,7 +204,7 @@ def main(argv=None):
             for a in (w, b, p):
                 f.write(a.astype("<f4").tobytes())
     write_meta(out / f"{stem}.meta", lay, args.batch, grouped, members_of(args.manifest, args.case), pos_file,
-               l1_file)
+               l1_file, args.refine)
     calib_sha = check = None
     if args.sim_check and args.l1 != "host":
         raise SystemExit("--sim-check supports the host layer-1 form")
@@ -205,7 +217,7 @@ def main(argv=None):
                                  sys.stderr, args.dtype, args.quant_algorithm, dataset,
                                  lay if args.sim_check else None)
     record = {"stem": stem, "layout": lay.describe(), "batch": args.batch, "conv": "grouped" if grouped else "dense",
-              "platform": args.platform, "l1": args.l1, "pool": args.pool, "dtype": args.dtype,
+              "platform": args.platform, "l1": args.l1, "pool": args.pool, "dtype": args.dtype, "refine": args.refine,
               "optimization_level": args.optimization_level,
               "toolkit": toolkit_version(), "onnx_sha256": digest(onnx_path),
               "meta_sha256": digest(out / f"{stem}.meta")}
