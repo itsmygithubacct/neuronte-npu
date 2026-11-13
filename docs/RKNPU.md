@@ -67,8 +67,21 @@ So on such a kernel, use core 0 only. The backend does this by itself. With
 names the RKNPU device, and when fewer than three cores are registered it
 sets `RKNN_NPU_CORE_0`. The count and mask are reported in
 `neuronte_npu_info` (`npu_cores`, `core_mask`) and in the benchmark JSON.
-Using all three cores needs a driver build that registers all three
-interrupts, which is a kernel change.
+
+Why, from the driver source: rknpu 0.9.3 decides whether the device tree
+names its interrupts with `platform_get_resource_byname(pdev,
+IORESOURCE_IRQ, "npu0_irq")`. Since Linux 5.19 the device-tree core no
+longer adds interrupt resources to platform devices (upstream commit
+`a1a2b7125e10`), so on a 6.1 kernel that lookup always fails and the driver
+falls back to requesting interrupt 0 alone, with the core-0 handler. No
+device-tree change helps. rknpu 0.9.4 fixed it (on 6.1 and later it looks
+the interrupts up with `platform_get_irq_byname`, falling back to
+`platform_get_irq`), and later versions keep the fix. The driver is usually
+built into the vendor kernel, so using all three cores means a kernel with
+rknpu 0.9.4 or later (check `/sys/kernel/debug/rknpu/version`, and that all
+three interrupt lines name `fdab0000.npu`). Rockchip's guide expects little
+from a multi-core mask on small networks; one context per core is the way to
+use the extra cores.
 
 ## Getting data in and out
 
