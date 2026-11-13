@@ -40,7 +40,13 @@ struct neuronte_npu_options {
     const char *rknn_path;   /* compiled model; may be NULL with FORCE_CPU */
     const char *runtime_lib; /* librknnrt.so path; NULL searches the loader path */
     int flags;
-    int core_mask;           /* RKNN core mask; 0 = runtime default */
+    int core_mask;           /* RKNN core mask (1 = core 0, 2 = core 1, 4 = core 2, ...). 0 = automatic:
+                              * core 0 when the RKNPU driver serves fewer than three cores (see
+                              * neuronte_npu_info.npu_cores), else the runtime default; -1 = always
+                              * the runtime default (no rknn_set_core_mask call). The runtime
+                              * default spreads concurrent contexts over cores, and a job on a core
+                              * whose interrupt the driver never registered hangs until the driver
+                              * times out and resets the NPU. */
     unsigned init_flags;     /* extra rknn_init flags (RKNN_FLAG_*), for experiments; normally 0.
                               * Zero-copy handles always add the two DISABLE_FLUSH flags: the
                               * backend syncs its own buffers. */
@@ -56,6 +62,10 @@ struct neuronte_npu_info {
     int pipeline;       /* host fill of batch k+1 overlaps the NPU run of batch k */
     unsigned init_flags; /* flags given to rknn_init */
     float refine_margin; /* see neuronte_npu_options */
+    int core_mask;      /* core mask applied with rknn_set_core_mask; 0 = runtime default */
+    int npu_cores;      /* NPU cores whose completion interrupt the RKNPU driver registered
+                         * (from /proc/interrupts); -1 = could not tell */
+    int dtype;          /* NPU input type: 0 float32, 1 float16, 2 int8 (quantized model) */
 };
 
 /* Per-call stage times in nanoseconds. NPU stages are zero on the CPU path.
@@ -63,7 +73,8 @@ struct neuronte_npu_info {
  * sum can exceed `total`. */
 struct neuronte_npu_timing {
     uint64_t features;  /* character features, or host layer 1, into the input buffer */
-    uint64_t input;     /* rknn_inputs_set or cache sync to device */
+    uint64_t input;     /* rknn_inputs_set or cache sync to device (with the pipeline, the
+                         * sync of batch k+1 runs on the fill thread and overlaps `run`) */
     uint64_t run;       /* rknn_run: the NPU executes the batch */
     uint64_t output;    /* rknn_outputs_get or cache sync from device */
     uint64_t assemble;  /* block coverage -> glyph masks (includes fp16 conversion) */

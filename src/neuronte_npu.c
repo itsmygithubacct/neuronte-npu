@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -113,6 +114,10 @@ struct neuronte_npu {
     rknn_tensor_mem *bound;   /* input buffer bound to the context */
     unsigned init_flags;      /* flags given to rknn_init */
     float refine_margin;      /* recompute ambiguous tiles on the CPU */
+    int core_mask;            /* applied core mask, 0 = runtime default */
+    int npu_cores;            /* cores with a registered completion interrupt, -1 unknown */
+    uint32_t *asm_off;        /* zero-copy: native output offset of each cell pixel of glyph 0 */
+    size_t asm_glyph;         /* zero-copy: native output elements from one glyph to the next */
     /* CPU */
     float *cpu_buf;
 };
@@ -294,6 +299,65 @@ static int rknpu_device(char *why, size_t why_len)
     return found;
 }
 
+/* How many NPU cores can complete jobs: the number of /proc/interrupts lines
+ * whose handler list names the RKNPU platform device (one completion
+ * interrupt per core). Some RK3588 kernels register only core 0's, although
+ * the device tree lists three; jobs sent to the other cores then finish in
+ * hardware but are never seen as done, and the driver times out after
+ * seconds and resets the NPU. -1 when it cannot be told. */
+static int rknpu_irq_cores(void)
+{
+    DIR *d = opendir("/sys/class/drm");
+    struct dirent *e;
+    char name[256] = "";
+    if (!d)
+        return -1;
+    while ((e = readdir(d))) {
+        char link[PATH_MAX], target[PATH_MAX];
+        ssize_t len;
+        if (strncmp(e->d_name, "card", 4))
+            continue;
+        snprintf(link, sizeof link, "/sys/class/drm/%s/device/driver", e->d_name);
+        len = readlink(link, target, sizeof target - 1);
+        if (len <= 0)
+            continue;
+        target[len] = 0;
+        if (!strstr(target, "RKNPU"))
+            continue;
+        snprintf(link, sizeof link, "/sys/class/drm/%s/device", e->d_name);
+        len = readlink(link, target, sizeof target - 1);
+        if (len > 0) {
+            const char *base;
+            target[len] = 0;
+            base = strrchr(target, '/');
+            snprintf(name, sizeof name, "%.200s", base ? base + 1 : target);
+        }
+        break;
+    }
+    closedir(d);
+    if (!name[0])
+        return -1;
+    FILE *f = fopen("/proc/interrupts", "r");
+    if (!f)
+        return -1;
+    char line[1024];
+    size_t nl = strlen(name);
+    int count = 0;
+    while (fgets(line, sizeof line, f)) {
+        const char *p = line;
+        while ((p = strstr(p, name))) {
+            char after = p[nl];
+            if (p > line && p[-1] == ' ' && (after == '\n' || after == ',' || after == ' ' || after == 0)) {
+                count++;
+                break;
+            }
+            p += nl;
+        }
+    }
+    fclose(f);
+    return count;
+}
+
 static int load_api(struct api *a, const char *lib, char *err, size_t err_len)
 {
     memset(a, 0, sizeof *a);
@@ -364,6 +428,9 @@ static size_t native_index(const rknn_tensor_attr *a, int c, int h, int w)
 
 static int native_supported(const rknn_tensor_attr *a)
 {
+    if (a->type == RKNN_TENSOR_INT8) /* quantized models: affine, native NC1HWC2 only */
+        return a->fmt == RKNN_TENSOR_NC1HWC2 && a->n_dims == 5 && a->qnt_type == RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC &&
+               a->scale > 0.0f;
     return (a->type == RKNN_TENSOR_FLOAT16 || a->type == RKNN_TENSOR_FLOAT32) &&
            ((a->fmt == RKNN_TENSOR_NC1HWC2 && a->n_dims == 5) ||
             ((a->fmt == RKNN_TENSOR_NHWC || a->fmt == RKNN_TENSOR_NCHW) && a->n_dims == 4));
@@ -389,7 +456,7 @@ static int load_host_l1(neuronte_npu *n, const struct neuronte_npu_options *o, c
     float *data;
     if (a->fmt != RKNN_TENSOR_NC1HWC2 || a->n_dims != 5 || a->dims[2] != (uint32_t)n->batch ||
         a->dims[3] != (uint32_t)n->l1_m || a->dims[1] * a->dims[4] < (uint32_t)n->l1_rows ||
-        (a->type != RKNN_TENSOR_FLOAT16 && a->type != RKNN_TENSOR_FLOAT32)) {
+        (a->type != RKNN_TENSOR_FLOAT16 && a->type != RKNN_TENSOR_FLOAT32 && a->type != RKNN_TENSOR_INT8)) {
         say(err, err_len, "host layer 1 needs an NC1HWC2 input of %d x %d x %d (got fmt %d dims %u,%u,%u,%u,%u)",
             n->l1_rows, n->batch, n->l1_m, a->fmt, a->dims[0], a->dims[1], a->dims[2], a->dims[3], a->dims[4]);
         return -1;
@@ -502,6 +569,41 @@ static rknn_tensor_mem *new_input_mem(neuronte_npu *n)
     return m;
 }
 
+/* Assembly table for the native output: the offset of every cell pixel for
+ * glyph 0 and the distance from one glyph (batch row) to the next. Each
+ * layout native_index accepts is linear in the batch index, so a glyph is
+ * then one gather over the cell, whatever the block size. Leaves asm_off
+ * NULL (the per-block loop is used) unless the blocks cover every pixel
+ * exactly once. */
+static void build_asm_table(neuronte_npu *n)
+{
+    const rknn_tensor_attr *a = &n->out_attr;
+    size_t plane = (size_t)n->cell_w * (size_t)n->cell_h, q;
+    uint32_t *off = malloc(plane * sizeof *off);
+    unsigned char *seen = calloc(plane, 1);
+    int g, r, i, ok = off && seen;
+    for (g = 0; ok && g < n->nblocks; g++)
+        for (r = 0; ok && r < n->bh; r++)
+            for (i = 0; ok && i < n->bw; i++) {
+                size_t k = native_index(a, g, 0, r * n->bw + i);
+                q = (size_t)(n->blocks[g].y + r) * (size_t)n->cell_w + (size_t)(n->blocks[g].x + i);
+                ok = q < plane && !seen[q] && k <= UINT32_MAX;
+                if (ok) {
+                    seen[q] = 1;
+                    off[q] = (uint32_t)k;
+                }
+            }
+    for (q = 0; ok && q < plane; q++)
+        ok = seen[q];
+    free(seen);
+    if (!ok) {
+        free(off);
+        return;
+    }
+    n->asm_off = off;
+    n->asm_glyph = native_index(a, 0, 1, 0) - native_index(a, 0, 0, 0);
+}
+
 static int open_rknn(neuronte_npu *n, const struct neuronte_npu_options *o, char *err, size_t err_len)
 {
     char dev[256];
@@ -539,8 +641,12 @@ static int open_rknn(neuronte_npu *n, const struct neuronte_npu_options *o, char
         return -1;
     }
     n->have_ctx = 1;
-    if (o->core_mask && (rc = n->api.set_core_mask(n->ctx, (rknn_core_mask)o->core_mask))) {
-        say(err, err_len, "rknn_set_core_mask(%d) failed (%d)", o->core_mask, rc);
+    n->npu_cores = rknpu_irq_cores();
+    n->core_mask = o->core_mask > 0 ? o->core_mask : 0;
+    if (o->core_mask == 0 && n->npu_cores >= 0 && n->npu_cores < 3)
+        n->core_mask = RKNN_NPU_CORE_0;
+    if (n->core_mask && (rc = n->api.set_core_mask(n->ctx, (rknn_core_mask)n->core_mask))) {
+        say(err, err_len, "rknn_set_core_mask(%d) failed (%d)", n->core_mask, rc);
         return -1;
     }
     memset(&ver, 0, sizeof ver);
@@ -596,6 +702,10 @@ static int open_rknn(neuronte_npu *n, const struct neuronte_npu_options *o, char
                 n->in_attr.fmt, n->in_attr.type, n->out_attr.fmt, n->out_attr.type);
             return -1;
         }
+        if ((n->in_attr.type == RKNN_TENSOR_INT8 || n->out_attr.type == RKNN_TENSOR_INT8) && !n->l1_file[0]) {
+            say(err, err_len, "quantized (int8) models are supported only in the host layer-1 form");
+            return -1;
+        }
         n->in_mem = new_input_mem(n);
         n->out_mem = n->api.create_mem(n->ctx, n->out_attr.size_with_stride);
         if (n->l1_file[0] && !(o->flags & NEURONTE_NPU_NO_PIPELINE))
@@ -613,6 +723,7 @@ static int open_rknn(neuronte_npu *n, const struct neuronte_npu_options *o, char
             return -1;
         }
         n->zero_copy = 1;
+        build_asm_table(n);
         if (n->pos_file[0] && bind_positions(n, o, err, err_len))
             return -1;
         if (n->l1_file[0] && load_host_l1(n, o, err, err_len))
@@ -646,6 +757,8 @@ static void close_rknn(neuronte_npu *n)
     free(n->in_f32);
     free(n->out_f32);
     n->in_f32 = n->out_f32 = NULL;
+    free(n->asm_off);
+    n->asm_off = NULL;
     free(n->l1_w);
     free(n->l1_b);
     free(n->l1_pn);
@@ -843,6 +956,53 @@ static void h1_row8(half *dst, const float *pn, const float *c, size_t width)
 #endif
 }
 
+/* One int8 NC1HWC2 row of h1 for a quantized model:
+ * dst[w][j] = sat8(round(ReLU(pn[w][j] + c[j]) / scale) + zp) for j < 16. */
+static void h1_row16_i8(int8_t *dst, const float *pn, const float *c, size_t width, float inv, int zp)
+{
+    size_t w;
+#ifdef HAVE_NEON_F16
+    float32x4_t cv[4], z = vdupq_n_f32(0.0f), vi = vdupq_n_f32(inv);
+    int32x4_t vz = vdupq_n_s32(zp);
+    int k;
+    for (k = 0; k < 4; k++)
+        cv[k] = vld1q_f32(c + 4 * k);
+    if (zp == -128) {
+        /* The usual case (ReLU output, calibrated from 0). Same result with
+         * fewer operations: round (v * inv) without the ReLU, saturate to
+         * [0, 255] unsigned (negative v gives 0, as ReLU then round does),
+         * and subtract 128 by flipping the top bit. */
+        const uint8x16_t top = vdupq_n_u8(0x80);
+        for (w = 0; w < width; w++, pn += 16, dst += 16) {
+            uint16x4_t u[4];
+            for (k = 0; k < 4; k++)
+                u[k] = vqmovun_s32(vcvtnq_s32_f32(vmulq_f32(vaddq_f32(vld1q_f32(pn + 4 * k), cv[k]), vi)));
+            uint8x16_t b = vcombine_u8(vqmovn_u16(vcombine_u16(u[0], u[1])), vqmovn_u16(vcombine_u16(u[2], u[3])));
+            vst1q_s8(dst, vreinterpretq_s8_u8(veorq_u8(b, top)));
+        }
+        return;
+    }
+    for (w = 0; w < width; w++, pn += 16, dst += 16) {
+        int32x4_t q[4];
+        for (k = 0; k < 4; k++) {
+            float32x4_t v = vmulq_f32(vmaxq_f32(vaddq_f32(vld1q_f32(pn + 4 * k), cv[k]), z), vi);
+            q[k] = vaddq_s32(vcvtnq_s32_f32(v), vz);
+        }
+        int16x8_t lo = vcombine_s16(vqmovn_s32(q[0]), vqmovn_s32(q[1]));
+        int16x8_t hi = vcombine_s16(vqmovn_s32(q[2]), vqmovn_s32(q[3]));
+        vst1q_s8(dst, vcombine_s8(vqmovn_s16(lo), vqmovn_s16(hi)));
+    }
+#else
+    int j;
+    for (w = 0; w < width; w++, pn += 16, dst += 16)
+        for (j = 0; j < 16; j++) {
+            float v = pn[j] + c[j];
+            long q = lrintf((v > 0.0f ? v : 0.0f) * inv) + zp;
+            dst[j] = (int8_t)(q < -128 ? -128 : q > 127 ? 127 : q);
+        }
+#endif
+}
+
 /* Layer 1 on the host: character part per glyph, then h1 into in_mem. */
 static void host_layer1(neuronte_npu *n, const uint32_t *scalars, int count, rknn_tensor_mem *mem)
 {
@@ -875,12 +1035,20 @@ static void host_layer1(neuronte_npu *n, const uint32_t *scalars, int count, rkn
                 h1_row8((half *)mem->virt_addr + (c1 * hh + (size_t)b) * ws * c2n, pn, c, width);
                 continue;
             }
+            if (a->type == RKNN_TENSOR_INT8 && c2n == 16) {
+                h1_row16_i8((int8_t *)mem->virt_addr + (c1 * hh + (size_t)b) * ws * c2n, pn, c, width,
+                            1.0f / a->scale, a->zp);
+                continue;
+            }
             for (w = 0; w < width; w++)
                 for (j = 0; j < c2n; j++) {
                     size_t k = ((c1 * hh + (size_t)b) * ws + w) * c2n + j;
                     float v = pn[w * c2n + j] + c[j];
                     v = v > 0.0f ? v : 0.0f;
-                    if (a->type == RKNN_TENSOR_FLOAT16)
+                    if (a->type == RKNN_TENSOR_INT8) {
+                        long q = lrintf(v / a->scale) + a->zp;
+                        ((int8_t *)mem->virt_addr)[k] = (int8_t)(q < -128 ? -128 : q > 127 ? 127 : q);
+                    } else if (a->type == RKNN_TENSOR_FLOAT16)
                         ((half *)mem->virt_addr)[k] = (half)v;
                     else
                         ((float *)mem->virt_addr)[k] = v;
@@ -889,17 +1057,19 @@ static void host_layer1(neuronte_npu *n, const uint32_t *scalars, int count, rkn
 }
 
 /* Write one batch's input: host layer 1 into `mem`, or the character
- * features into the input buffer. A short batch is padded with its first
- * scalar. Thread-safe against npu_exec on another buffer. */
-static void npu_fill(neuronte_npu *n, const uint32_t *scalars, int count, rknn_tensor_mem *mem, uint64_t *ns)
+ * features into the input buffer, and in zero-copy mode clean it from the
+ * CPU caches for the NPU. A short batch is padded with its first scalar.
+ * Runs on the fill thread while npu_exec runs another buffer; returns the
+ * cache-sync status. */
+static int npu_fill(neuronte_npu *n, const uint32_t *scalars, int count, rknn_tensor_mem *mem, uint64_t *ns,
+                    uint64_t *sync_ns)
 {
-    uint64_t t0 = now_ns();
-    int B = n->batch, b, t, i;
+    uint64_t t0 = now_ns(), t1;
+    int B = n->batch, b, t, i, rc = 0;
     float v[CODE];
     if (n->l1_file[0]) {
         host_layer1(n, scalars, count, mem);
-        *ns += now_ns() - t0;
-        return;
+        goto sync;
     }
     for (b = 0; b < B; b++) {
         uint32_t s = scalars[b < count ? b : 0];
@@ -921,7 +1091,14 @@ static void npu_fill(neuronte_npu *n, const uint32_t *scalars, int count, rknn_t
             }
         }
     }
-    *ns += now_ns() - t0;
+sync:
+    t1 = now_ns();
+    *ns += t1 - t0;
+    if (n->zero_copy) {
+        rc = n->api.mem_sync(n->ctx, mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+        *sync_ns += now_ns() - t1;
+    }
+    return rc;
 }
 
 /* Run the batch held in `mem` and assemble `count` glyphs into `out`. */
@@ -938,7 +1115,7 @@ static int npu_exec(neuronte_npu *n, rknn_tensor_mem *mem, int count, float *out
                 return rc;
             n->bound = mem;
         }
-        rc = n->api.mem_sync(n->ctx, mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+        /* npu_fill already synced `mem` to the device */
     } else {
         rknn_input in;
         memset(&in, 0, sizeof in);
@@ -972,23 +1149,65 @@ static int npu_exec(neuronte_npu *n, rknn_tensor_mem *mem, int count, float *out
     if (rc)
         return rc;
     t4 = now_ns();
-    for (g = 0; g < n->nblocks; g++) {
-        const struct block *bk = &n->blocks[g];
+    if (n->asm_off) {
+        const rknn_tensor_attr *a = &n->out_attr;
+        const uint32_t *off = n->asm_off;
+        size_t q;
         for (b = 0; b < count; b++) {
-            float *dst = out + (size_t)b * plane + (size_t)bk->y * n->cell_w + bk->x;
-            if (n->zero_copy) {
-                const rknn_tensor_attr *a = &n->out_attr;
-                for (r = 0; r < n->bh; r++)
-                    for (i = 0; i < n->bw; i++) {
-                        size_t k = native_index(a, g, b, r * n->bw + i);
-                        dst[(size_t)r * n->cell_w + i] = a->type == RKNN_TENSOR_FLOAT16
-                                                             ? (float)((const half *)n->out_mem->virt_addr)[k]
-                                                             : ((const float *)n->out_mem->virt_addr)[k];
-                    }
+            float *d = out + (size_t)b * plane;
+            size_t base = (size_t)b * n->asm_glyph;
+            if (a->type == RKNN_TENSOR_FLOAT16) {
+                const half *src = (const half *)n->out_mem->virt_addr + base;
+                for (q = 0; q < plane; q++)
+                    d[q] = (float)src[off[q]];
+            } else if (a->type == RKNN_TENSOR_INT8) {
+                const int8_t *src = (const int8_t *)n->out_mem->virt_addr + base;
+                const int zp = a->zp;
+                const float sc = a->scale;
+                for (q = 0; q < plane; q++)
+                    d[q] = (float)(src[off[q]] - zp) * sc;
             } else {
-                const float *src = n->out_f32 + ((size_t)g * (size_t)B + (size_t)b) * (size_t)n->out_p;
-                for (r = 0; r < n->bh; r++)
-                    memcpy(dst + (size_t)r * n->cell_w, src + (size_t)r * n->bw, (size_t)n->bw * sizeof *dst);
+                const float *src = (const float *)n->out_mem->virt_addr + base;
+                for (q = 0; q < plane; q++)
+                    d[q] = src[off[q]];
+            }
+        }
+    } else {
+        /* per block: non-zero-copy output, or blocks that do not tile the cell */
+        for (g = 0; g < n->nblocks; g++) {
+            const struct block *bk = &n->blocks[g];
+            for (b = 0; b < count; b++) {
+                float *dst = out + (size_t)b * plane + (size_t)bk->y * n->cell_w + bk->x;
+                if (n->zero_copy) {
+                    const rknn_tensor_attr *a = &n->out_attr;
+                    /* consecutive pixels of a block row are `step` elements apart */
+                    size_t step = a->fmt == RKNN_TENSOR_NC1HWC2 ? a->dims[4]
+                                  : a->fmt == RKNN_TENSOR_NHWC  ? a->dims[3]
+                                                                : 1;
+                    for (r = 0; r < n->bh; r++) {
+                        size_t k = native_index(a, g, b, r * n->bw);
+                        float *d = dst + (size_t)r * n->cell_w;
+                        if (a->type == RKNN_TENSOR_FLOAT16) {
+                            const half *src = (const half *)n->out_mem->virt_addr + k;
+                            for (i = 0; i < n->bw; i++)
+                                d[i] = (float)src[(size_t)i * step];
+                        } else if (a->type == RKNN_TENSOR_INT8) {
+                            const int8_t *src = (const int8_t *)n->out_mem->virt_addr + k;
+                            int zp = a->zp;
+                            float sc = a->scale;
+                            for (i = 0; i < n->bw; i++)
+                                d[i] = (float)(src[(size_t)i * step] - zp) * sc;
+                        } else {
+                            const float *src = (const float *)n->out_mem->virt_addr + k;
+                            for (i = 0; i < n->bw; i++)
+                                d[i] = src[(size_t)i * step];
+                        }
+                    }
+                } else {
+                    const float *src = n->out_f32 + ((size_t)g * (size_t)B + (size_t)b) * (size_t)n->out_p;
+                    for (r = 0; r < n->bh; r++)
+                        memcpy(dst + (size_t)r * n->cell_w, src + (size_t)r * n->bw, (size_t)n->bw * sizeof *dst);
+                }
             }
         }
     }
@@ -1005,13 +1224,14 @@ struct fill_job {
     const uint32_t *scalars;
     int count;
     rknn_tensor_mem *mem;
-    uint64_t ns;
+    uint64_t ns, sync_ns;
+    int rc;
 };
 
 static void *fill_main(void *arg)
 {
     struct fill_job *j = arg;
-    npu_fill(j->n, j->scalars, j->count, j->mem, &j->ns);
+    j->rc = npu_fill(j->n, j->scalars, j->count, j->mem, &j->ns, &j->sync_ns);
     return NULL;
 }
 
@@ -1025,7 +1245,8 @@ static int npu_coverage(neuronte_npu *n, const uint32_t *scalars, int count, flo
     int B = n->batch, done, i, rc = 0;
     if (count == 0)
         return 0;
-    npu_fill(n, scalars, count < B ? count : B, buf[0], &tm->features);
+    if ((rc = npu_fill(n, scalars, count < B ? count : B, buf[0], &tm->features, &tm->input)))
+        return rc;
     for (i = 0, done = 0; done < count; i++, done += B) {
         int k = count - done < B ? count - done : B;
         int next = done + B < count;
@@ -1037,7 +1258,8 @@ static int npu_coverage(neuronte_npu *n, const uint32_t *scalars, int count, flo
             job.scalars = scalars + done + B;
             job.count = count - done - B < B ? count - done - B : B;
             job.mem = buf[(i + 1) & 1];
-            job.ns = 0;
+            job.ns = job.sync_ns = 0;
+            job.rc = 0;
             if (n->in_mem2 && pthread_create(&th, NULL, fill_main, &job) == 0)
                 threaded = 1;
         }
@@ -1048,8 +1270,12 @@ static int npu_coverage(neuronte_npu *n, const uint32_t *scalars, int count, flo
             pthread_join(th, NULL);
         else if (next && !rc)
             fill_main(&job);
-        if (next)
+        if (next) {
             tm->features += job.ns;
+            tm->input += job.sync_ns;
+            if (!rc)
+                rc = job.rc;
+        }
         if (rc)
             break;
     }
@@ -1086,6 +1312,10 @@ int neuronte_npu_info(const neuronte_npu *n, struct neuronte_npu_info *info)
         info->pipeline = n->in_mem2 != NULL;
         info->init_flags = n->init_flags;
         info->refine_margin = n->refine_margin;
+        info->core_mask = n->core_mask;
+        info->npu_cores = n->npu_cores;
+        info->dtype = n->zero_copy ? (n->in_attr.type == RKNN_TENSOR_INT8 ? 2 : n->in_attr.type == RKNN_TENSOR_FLOAT16)
+                                   : 0;
     }
     return 0;
 }

@@ -31,7 +31,16 @@ build/neuronte_npu_bench: bench/neuronte_npu_bench.c build/neuronte_npu.o | buil
 build/rknn_probe: bench/rknn_probe.c | build
 	$(CC) -I$(RKNN_INCLUDE) $(CFLAGS) $(WARN) -o $@ $< -ldl -lm
 
+# Python tests (exporter, graph variants, tools). Tests that need a model
+# manifest or the reference library skip unless these are set:
+#   make check PYTHON=/path/to/python NEURONTE_MANIFEST=... NEURONTE_LIB=.../libneuronte.so
+PYTHON ?= python3
+check:
+	PYTHONPATH=python NEURONTE_MANIFEST="$(NEURONTE_MANIFEST)" NEURONTE_LIB="$(NEURONTE_LIB)" \
+		$(PYTHON) -m pytest -q tests
+	sh -n tools/run-set.sh && sh -n tools/npu-run.sh && sh -n tools/npu-discover.sh
+
 clean:
 	rm -rf build
 
-.PHONY: all clean
+.PHONY: all check clean

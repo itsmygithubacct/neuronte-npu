@@ -1,13 +1,21 @@
 """Export a model set to ONNX and compile it for a Rockchip NPU.
 
     python -m neuronte_npu.convert --manifest M --case NAME --cell 16x32 \
-        --batch 256 --out DIR [--dense] [--platform rk3588] [--onnx-only]
+        --batch 256 --out DIR [--dense] [--platform rk3588] [--onnx-only] \
+        [--pool avg|conv] [--dtype fp16|w8a8 [--quant-algorithm normal|mmse]]
 
-Writes NAME-WxH-bB-{g|d}-L1.onnx, .rknn (unless --onnx-only) and .meta, plus
-a .l1 (host layer 1: character weights, biases and position term) or .pos
-(position input) sidecar for the forms that need one. The .meta text file
-tells the C backend how to build inputs and assemble outputs. Compilation
-uses RKNN-Toolkit2 and is float16 (no quantization).
+Writes NAME-WxH-bB-{g|d}-L1[-pconv][-w8a8-ALGO].onnx, .rknn (unless
+--onnx-only) and .meta, plus a .l1 (host layer 1: character weights, biases
+and position term) or .pos (position input) sidecar for the forms that need
+one. The .meta text file tells the C backend how to build inputs and
+assemble outputs. Compilation uses RKNN-Toolkit2, float16 by default.
+
+--dtype w8a8 quantizes weights and activations to int8 (host layer-1 form
+only). Calibration data is the graph input for every scalar of the Braille
+block U+2800..U+28FF, the whole input domain of these models, in batches of
+the model's batch size; its sha256 is recorded. Quantization error depends
+on the model: score every quantized model against the CPU before use, and
+give the backend a refine_margin above its largest error.
 """
 
 import argparse
@@ -15,6 +23,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 
 from . import graph, layout as L, nrt
 
@@ -65,21 +74,73 @@ def members_of(manifest, case_name):
     return [data["models"][m] for m in case["members"]]
 
 
-def compile_rknn(onnx_path, rknn_path, platform, level, log):
+def write_calibration(lay, batch, out_dir):
+    """Graph inputs for every Braille scalar, as .npy files and a dataset list.
+    Returns (dataset path, sha256 over the arrays in order)."""
+    import numpy as np
+    first, last = L.BRAILLE_SPAN
+    scalars = list(range(first, last + 1))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    lines = []
+    for k in range(0, len(scalars), batch):
+        chunk = scalars[k:k + batch]
+        chunk += [chunk[0]] * (batch - len(chunk))  # pad like the backend does
+        x = graph.host_input(lay, chunk)
+        h.update(np.ascontiguousarray(x).tobytes())
+        path = out_dir / f"{k // batch:04d}.npy"
+        np.save(path, x)
+        lines.append(str(path.resolve()))
+    dataset = out_dir / "dataset.txt"
+    dataset.write_text("\n".join(lines) + "\n")
+    return dataset, h.hexdigest()
+
+
+def sim_check(rknn, onnx_path, dataset, lay):
+    """Run the compiled model in the toolkit's simulator on every dataset
+    input and compare its coverage with the float ONNX graph (which matches
+    the CPU library to about 1e-5). The simulator reproduces the NPU's
+    quantized arithmetic closely, so this screens a quantized model before
+    it reaches a board."""
+    import numpy as np
+    import onnxruntime as ort
+    if rknn.init_runtime() != 0:
+        raise RuntimeError("rknn.init_runtime (simulator) failed")
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    worst, flips, near = 0.0, 0, 0
+    for path in Path(dataset).read_text().split():
+        x = np.load(path)
+        ref = graph.assemble(lay, sess.run(None, {"h1": x})[0])
+        got = graph.assemble(lay, rknn.inference(inputs=[x], data_format=["nchw"])[0])
+        worst = max(worst, float(np.abs(got - ref).max()))
+        flips += int(((got >= 0.5) != (ref >= 0.5)).sum())
+        near += int((np.abs(ref - 0.5) < 0.05).sum())
+    return {"sim_max_abs": worst, "sim_flips": flips, "near_threshold_0.05": near}
+
+
+def compile_rknn(onnx_path, rknn_path, platform, level, log, dtype="fp16", algorithm="normal", dataset=None,
+                 check_lay=None):
+    """Compile; with check_lay (a layout) and a dataset, also return sim_check()."""
     from rknn.api import RKNN
     rknn = RKNN(verbose=False)
+    result = None
     try:
-        if rknn.config(target_platform=platform, optimization_level=level) != 0:
+        quant = dtype != "fp16"
+        extra = {"quantized_dtype": dtype, "quantized_algorithm": algorithm} if quant else {}
+        if rknn.config(target_platform=platform, optimization_level=level, **extra) != 0:
             raise RuntimeError("rknn.config failed")
         if rknn.load_onnx(model=str(onnx_path)) != 0:
             raise RuntimeError("rknn.load_onnx failed")
-        if rknn.build(do_quantization=False) != 0:
+        if rknn.build(do_quantization=quant, dataset=str(dataset) if quant else None) != 0:
             raise RuntimeError("rknn.build failed")
         if rknn.export_rknn(str(rknn_path)) != 0:
             raise RuntimeError("rknn.export_rknn failed")
+        if check_lay is not None and dataset is not None:
+            result = sim_check(rknn, onnx_path, dataset, check_lay)
     finally:
         rknn.release()
     print(f"compiled {rknn_path}", file=log)
+    return result
 
 
 def main(argv=None):
@@ -95,7 +156,15 @@ def main(argv=None):
     ap.add_argument("--optimization-level", type=int, default=3)
     ap.add_argument("--out", required=True)
     ap.add_argument("--onnx-only", action="store_true")
+    ap.add_argument("--pool", default="avg", choices=("avg", "conv"),
+                    help="sample averaging: AveragePool, or the same as a strided depthwise conv")
+    ap.add_argument("--dtype", default="fp16", choices=("fp16", "w8a8"))
+    ap.add_argument("--quant-algorithm", default="normal", choices=("normal", "mmse", "kl_divergence"))
+    ap.add_argument("--sim-check", action="store_true",
+                    help="score the compiled model in the toolkit simulator over every Braille scalar")
     args = ap.parse_args(argv)
+    if args.dtype != "fp16" and args.l1 != "host":
+        raise SystemExit("--dtype w8a8 needs --l1 host (the backend quantizes h1 itself)")
     w, h = map(int, args.cell.lower().split("x"))
     if not 1 <= args.batch <= 4096:
         raise SystemExit("batch must be 1..4096")
@@ -104,7 +173,11 @@ def main(argv=None):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     stem = f"{args.case}-{w}x{h}-b{args.batch}-{'g' if grouped else 'd'}-{args.l1}"
-    model = graph.build(lay, args.batch, grouped, args.l1)
+    if args.pool != "avg":
+        stem += f"-p{args.pool}"
+    if args.dtype != "fp16":
+        stem += f"-{args.dtype}-{args.quant_algorithm}"
+    model = graph.build(lay, args.batch, grouped, args.l1, args.pool)
     onnx_path = out / f"{stem}.onnx"
     onnx_path.write_bytes(model.SerializeToString())
     pos_file = None
@@ -120,12 +193,27 @@ def main(argv=None):
                 f.write(a.astype("<f4").tobytes())
     write_meta(out / f"{stem}.meta", lay, args.batch, grouped, members_of(args.manifest, args.case), pos_file,
                l1_file)
+    calib_sha = check = None
+    if args.sim_check and args.l1 != "host":
+        raise SystemExit("--sim-check supports the host layer-1 form")
     if not args.onnx_only:
-        compile_rknn(onnx_path, out / f"{stem}.rknn", args.platform, args.optimization_level, sys.stderr)
+        with tempfile.TemporaryDirectory(prefix=f".{stem}.calib-", dir=out) as tmp:
+            dataset = None
+            if args.dtype != "fp16" or args.sim_check:  # inputs are large; only their sha256 is kept
+                dataset, calib_sha = write_calibration(lay, args.batch, Path(tmp))
+            check = compile_rknn(onnx_path, out / f"{stem}.rknn", args.platform, args.optimization_level,
+                                 sys.stderr, args.dtype, args.quant_algorithm, dataset,
+                                 lay if args.sim_check else None)
     record = {"stem": stem, "layout": lay.describe(), "batch": args.batch, "conv": "grouped" if grouped else "dense",
-              "platform": args.platform, "l1": args.l1, "optimization_level": args.optimization_level,
+              "platform": args.platform, "l1": args.l1, "pool": args.pool, "dtype": args.dtype,
+              "optimization_level": args.optimization_level,
               "toolkit": toolkit_version(), "onnx_sha256": digest(onnx_path),
               "meta_sha256": digest(out / f"{stem}.meta")}
+    if args.dtype != "fp16":
+        record.update(quant_algorithm=args.quant_algorithm, calibration="U+2800..U+28FF host_input",
+                      calibration_sha256=calib_sha)
+    if check:
+        record.update(check)
     if pos_file:
         record["pos_sha256"] = digest(out / pos_file)
     if l1_file:

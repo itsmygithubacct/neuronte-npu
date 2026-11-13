@@ -201,8 +201,10 @@ int main(int argc, char **argv)
     struct neuronte_npu_info info;
     neuronte_npu_info(n, &info);
     fprintf(o, ",\"info\":{\"layer1\":\"%s\",\"zero_copy\":%d,\"pipeline\":%d,\"init_flags\":%u,"
-            "\"refine_margin\":%g}", info.layer1 == 2 ? "host" : info.layer1 == 1 ? "npu" : "cpu", info.zero_copy,
-            info.pipeline, info.init_flags, (double)info.refine_margin);
+            "\"refine_margin\":%g,\"core_mask\":%d,\"npu_cores\":%d,\"dtype\":\"%s\"}",
+            info.layer1 == 2 ? "host" : info.layer1 == 1 ? "npu" : "cpu", info.zero_copy, info.pipeline,
+            info.init_flags, (double)info.refine_margin, info.core_mask, info.npu_cores,
+            info.dtype == 2 ? "int8" : info.dtype == 1 ? "float16" : "float32");
 
     size_t plane = (size_t)cw * (size_t)ch;
     uint32_t corpus[CORPUS];

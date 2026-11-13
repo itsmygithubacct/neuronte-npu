@@ -81,10 +81,18 @@ def weights(layout, grouped=True):
 L1_ACTIVATIONS = ("host", "input", "input-relu", "input-convadd", "input-shared", "tiled", "deconv", "relu", "conv",
                   "clip")
 POS_INPUTS = ("input", "input-relu", "input-convadd", "input-shared")
+POOLS = ("avg", "conv", "host")
 
 
-def build(layout, batch, grouped=True, l1="host"):
+def build(layout, batch, grouped=True, l1="host", pool="avg"):
     """Return an onnx.ModelProto for `batch` glyphs of this layout.
+
+    `pool` chooses how each pixel's S*S sample coverages are averaged:
+      avg   AveragePool [1, S*S] (default).
+      conv  a depthwise Conv with a [1, S*S] kernel of 1/(S*S) and the same
+            stride: the same arithmetic on the convolution engine.
+      host  no pooling: the output is per sample, [1, G, B, M], and the
+            host averages. Only for the C backend's "pool host" meta line.
 
     `l1` chooses how layer 1 combines the per-glyph and per-sample parts:
       host    layer 1 runs on the host: the graph INPUT is h1 [1, C, B, M],
@@ -124,6 +132,8 @@ def build(layout, batch, grouped=True, l1="host"):
     """
     if l1 not in L1_ACTIVATIONS:
         raise ValueError(f"l1 must be one of {L1_ACTIVATIONS}")
+    if pool not in POOLS:
+        raise ValueError(f"pool must be one of {POOLS}")
     h = layout.hidden
     g_count, t_count = len(layout.blocks), len(layout.tiles)
     m = layout.samples_per_block
@@ -191,13 +201,16 @@ def build(layout, batch, grouped=True, l1="host"):
         helper.make_node("Conv", ["h3", "w4", "b4"], ["f"], kernel_shape=[1, 1], group=groups),
         helper.make_node("Clip", ["f", "lo", "hi"], ["v"]),
     ]
-    out = "v"
-    if s2 > 1:
-        nodes.append(helper.make_node("AveragePool", ["v"], ["cover"], kernel_shape=[1, s2], strides=[1, s2]))
-        out = "cover"
+    out = "cover"
+    pooled = s2 > 1 and pool != "host"
+    if pooled and pool == "conv":
+        init.append(numpy_helper.from_array(np.full((g_count, 1, 1, s2), 1.0 / s2, np.float32), "pool_w"))
+        nodes.append(helper.make_node("Conv", ["v", "pool_w"], [out], kernel_shape=[1, s2], strides=[1, s2],
+                                      group=g_count))
+    elif pooled:
+        nodes.append(helper.make_node("AveragePool", ["v"], [out], kernel_shape=[1, s2], strides=[1, s2]))
     else:
-        nodes.append(helper.make_node("Identity", ["v"], ["cover"]))
-        out = "cover"
+        nodes.append(helper.make_node("Identity", ["v"], [out]))
     if l1 == "host":
         inputs = [helper.make_tensor_value_info("h1", TensorProto.FLOAT, [1, rows, batch, m])]
     else:
@@ -205,7 +218,7 @@ def build(layout, batch, grouped=True, l1="host"):
     if l1 in POS_INPUTS:
         pos_batch = 1 if l1 == "input-shared" else batch
         inputs.append(helper.make_tensor_value_info("pos", TensorProto.FLOAT, [1, rows, pos_batch, m]))
-    outputs = [helper.make_tensor_value_info(out, TensorProto.FLOAT, [1, g_count, batch, m // s2])]
+    outputs = [helper.make_tensor_value_info(out, TensorProto.FLOAT, [1, g_count, batch, m // s2 if pooled else m])]
     graph = helper.make_graph(nodes, f"neuronte_{layout.name}", inputs, outputs, init)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)],
                               producer_name="neuronte-npu")
@@ -248,7 +261,12 @@ def code_input(layout, scalars):
 
 
 def assemble(layout, cover):
-    """[1, G, B, bh*bw] block coverage -> [B, cell_h, cell_w] glyph masks."""
+    """[1, G, B, bh*bw] block coverage -> [B, cell_h, cell_w] glyph masks.
+
+    Per-sample output ([1, G, B, M], pool="host") is averaged first."""
+    s2 = layout.samples * layout.samples
+    if s2 > 1 and cover.shape[3] == layout.samples_per_block:
+        cover = cover.reshape(*cover.shape[:3], -1, s2).mean(axis=4)
     _, g_count, batch, _ = cover.shape
     out = np.empty((batch, layout.cell_h, layout.cell_w), dtype=np.float32)
     bw, bh = layout.block_w, layout.block_h
